@@ -415,3 +415,6 @@ defaults:
   istio_cni:
     enabled: false
     chained: true
+  # applies to mutating and validation webhook
+  webhookConfig:
+    caBundle: ""
