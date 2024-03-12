@@ -15,6 +15,8 @@
 package gateway
 
 import (
+	"fmt"
+
 	"istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/config"
@@ -41,64 +43,42 @@ func (*CertificateAnalyzer) Metadata() analysis.Metadata {
 
 // Analyze implements analysis.Analyzer
 func (gateway *CertificateAnalyzer) Analyze(context analysis.Context) {
+	gatewayIndexByCert := initIndex(context)
 	context.ForEach(gvk.Gateway, func(resource *resource.Instance) bool {
-		gateway.analyzeDuplicateCertificate(resource, context, features.ScopeGatewayToNamespace)
+		gateway.analyzeDuplicateCertificate(resource, context, features.ScopeGatewayToNamespace, gatewayIndexByCert)
 		return true
 	})
 }
 
-func (gateway *CertificateAnalyzer) analyzeDuplicateCertificate(currentResource *resource.Instance, context analysis.Context, scopeGatewayToNamespace bool) {
+func (gateway *CertificateAnalyzer) analyzeDuplicateCertificate(currentResource *resource.Instance, context analysis.Context, scopeGatewayToNamespace bool, gatewayIndexByCert map[string][]*resource.Instance) {
 	currentGateway := currentResource.Message.(*v1alpha3.Gateway)
 	currentGatewayFullName := currentResource.Metadata.FullName
-	gateways := getGatewaysWithSelector(context, scopeGatewayToNamespace, currentGatewayFullName, currentGateway.Selector)
+	// gateways := getGatewaysWithSelector(context, scopeGatewayToNamespace, currentGatewayFullName, currentGateway.Selector)
 
-	for _, gatewayFullName := range gateways {
-		// ignore matching the same exact gateway
-		if currentGatewayFullName == gatewayFullName {
+	for _, currentServer := range currentGateway.Servers {
+		if currentServer.Tls == nil {
 			continue
 		}
+		key := tlsSettingsToString(currentServer.Tls)
+		gateways := gatewayIndexByCert[key]
+		for _, gatewayInstance := range gateways {
+			// ignore matching the same exact gateway
+			if currentGatewayFullName == gatewayInstance.Metadata.FullName {
+				continue
+			}
 
-		gatewayInstance := context.Find(gvk.Gateway, gatewayFullName)
-		gateway := gatewayInstance.Message.(*v1alpha3.Gateway)
-		for _, currentServer := range currentGateway.Servers {
-			for _, server := range gateway.Servers {
-				// make sure have TLS configuration
-				if currentServer.Tls == nil || server.Tls == nil {
-					continue
+			if gatewaySelectorMatches(currentResource, gatewayInstance, scopeGatewayToNamespace) {
+				gatewayNames := []string{currentGatewayFullName.String(), gatewayInstance.Metadata.FullName.String()}
+				message := msg.NewGatewayDuplicateCertificate(currentResource, gatewayNames)
+
+				if line, ok := util.ErrorLine(currentResource, util.MetadataName); ok {
+					message.Line = line
 				}
 
-				if haveSameCertificate(currentServer.Tls, server.Tls) {
-					gatewayNames := []string{currentGatewayFullName.String(), gatewayFullName.String()}
-					message := msg.NewGatewayDuplicateCertificate(currentResource, gatewayNames)
-
-					if line, ok := util.ErrorLine(currentResource, util.MetadataName); ok {
-						message.Line = line
-					}
-
-					context.Report(gvk.Gateway, message)
-				}
+				context.Report(gvk.Gateway, message)
 			}
 		}
 	}
-}
-
-func haveSameCertificate(currentGatewayTLS, gatewayTLS *v1alpha3.ServerTLSSettings) bool {
-	if currentGatewayTLS.CredentialName != "" && gatewayTLS.CredentialName != "" {
-		return currentGatewayTLS.CredentialName == gatewayTLS.CredentialName
-	}
-
-	if currentGatewayTLS.CredentialName == "" && gatewayTLS.CredentialName == "" {
-		if currentGatewayTLS.ServerCertificate != "" && gatewayTLS.ServerCertificate != "" {
-			if currentGatewayTLS.ServerCertificate == gatewayTLS.ServerCertificate {
-				if currentGatewayTLS.PrivateKey != "" && gatewayTLS.PrivateKey != "" {
-					return currentGatewayTLS.PrivateKey == gatewayTLS.PrivateKey
-				}
-				return false
-			}
-		}
-	}
-
-	return false
 }
 
 // get all gateways that is superset of the selector
@@ -132,6 +112,28 @@ func getGatewaysWithSelector(c analysis.Context, gwScope bool, currentGWName res
 	return gateways
 }
 
+func gatewaySelectorMatches(currentGW, gatewayR *resource.Instance, gwScope bool) bool {
+	// if scopeToNamespace true, ignore gateways from other namespace
+	if gwScope {
+		if currentGW.Metadata.FullName.Namespace != gatewayR.Metadata.FullName.Namespace {
+			return false
+		}
+	}
+
+	currentGateway := currentGW.Message.(*v1alpha3.Gateway)
+	// if current gateway selector is empty, match all gateway
+	if len(currentGateway.Selector) == 0 {
+		return true
+	}
+
+	gateway := gatewayR.Message.(*v1alpha3.Gateway)
+	// if current gateway selector is subset of other gateway selector
+	if selectorSubset(currentGateway.Selector, gateway.Selector) {
+		return true
+	}
+	return false
+}
+
 func selectorSubset(selectorX, selectorY map[string]string) bool {
 	var count int
 
@@ -153,4 +155,26 @@ func selectorSubset(selectorX, selectorY map[string]string) bool {
 	// if total counting is not same with the length
 	// of selectorX, selectorX is not subset of selectorY
 	return count == len(selectorX)
+}
+
+// creating an index of observed strings (credential name, server cert, key, etc), iterating through each Gateway only once.
+// When a key is encountered and already exists in the map, report.
+func initIndex(c analysis.Context) map[string][]*resource.Instance {
+	gatewayIndexByCert := make(map[string][]*resource.Instance)
+	c.ForEach(gvk.Gateway, func(resource *resource.Instance) bool {
+		gateway := resource.Message.(*v1alpha3.Gateway)
+		for _, server := range gateway.Servers {
+			if server.Tls == nil {
+				continue
+			}
+			key := tlsSettingsToString(server.Tls)
+			gatewayIndexByCert[key] = append(gatewayIndexByCert[key], resource)
+		}
+		return true
+	})
+	return gatewayIndexByCert
+}
+
+func tlsSettingsToString(tls *v1alpha3.ServerTLSSettings) string {
+	return fmt.Sprintf("%s-%s-%s", tls.CredentialName, tls.ServerCertificate, tls.PrivateKey)
 }

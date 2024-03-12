@@ -50,13 +50,39 @@ func (*IngressGatewayPortAnalyzer) Metadata() analysis.Metadata {
 
 // Analyze implements analysis.Analyzer
 func (s *IngressGatewayPortAnalyzer) Analyze(c analysis.Context) {
+	// create index of pods by namespace
+	podsByNamespace := map[string][]*resource.Instance{}
+	c.ForEach(gvk.Pod, func(r *resource.Instance) bool {
+		ns := r.Metadata.FullName.Namespace.String()
+		podsByNamespace[ns] = append(podsByNamespace[ns], r)
+		return true
+	})
+	// for each pod, create an index of services lists by pod name
+	servicesByPod := map[string][]*resource.Instance{}
+	c.ForEach(gvk.Service, func(r *resource.Instance) bool {
+		svc := r.Message.(*v1.ServiceSpec)
+		ns := r.Metadata.FullName.Namespace.String()
+		for _, pod := range podsByNamespace[ns] {
+			podLabels := klabels.Set(pod.Metadata.Labels)
+			svcSelector := klabels.SelectorFromSet(svc.Selector)
+			if svcSelector.Matches(podLabels) {
+				servicesByPod[pod.Metadata.FullName.String()] = append(servicesByPod[pod.Metadata.FullName.String()], r)
+			}
+		}
+		return true
+	})
+
 	c.ForEach(gvk.Gateway, func(r *resource.Instance) bool {
-		s.analyzeGateway(r, c)
+		s.analyzeGateway(r, c, servicesByPod)
 		return true
 	})
 }
 
-func (*IngressGatewayPortAnalyzer) analyzeGateway(r *resource.Instance, c analysis.Context) {
+func (*IngressGatewayPortAnalyzer) analyzeGateway(
+	r *resource.Instance,
+	c analysis.Context,
+	serviceByPod map[string][]*resource.Instance,
+) {
 	gw := r.Message.(*v1alpha3.Gateway)
 
 	// Typically there will be a single istio-ingressgateway service, which will select
@@ -72,12 +98,8 @@ func (*IngressGatewayPortAnalyzer) analyzeGateway(r *resource.Instance, c analys
 		podLabels := klabels.Set(rPod.Metadata.Labels)
 		if gwSelector.Matches(podLabels) {
 			gwSelectorMatches++
-			c.ForEach(gvk.Service, func(rSvc *resource.Instance) bool {
-				nsSvc := string(rSvc.Metadata.FullName.Namespace)
-				if nsSvc != rPod.Metadata.FullName.Namespace.String() {
-					return true // Services only select pods in their namespace
-				}
 
+			for _, rSvc := range serviceByPod[rPod.Metadata.FullName.String()] {
 				service := rSvc.Message.(*v1.ServiceSpec)
 				// TODO I want to match service.Namespace to pod.ObjectMeta.Namespace
 				svcSelector := klabels.SelectorFromSet(service.Selector)
@@ -94,8 +116,7 @@ func (*IngressGatewayPortAnalyzer) analyzeGateway(r *resource.Instance, c analys
 						}
 					}
 				}
-				return true
-			})
+			}
 		}
 		return true
 	})
