@@ -53,7 +53,6 @@ func (gateway *CertificateAnalyzer) Analyze(context analysis.Context) {
 func (gateway *CertificateAnalyzer) analyzeDuplicateCertificate(currentResource *resource.Instance, context analysis.Context, scopeGatewayToNamespace bool, gatewayIndexByCert map[string][]*resource.Instance) {
 	currentGateway := currentResource.Message.(*v1alpha3.Gateway)
 	currentGatewayFullName := currentResource.Metadata.FullName
-	// gateways := getGatewaysWithSelector(context, scopeGatewayToNamespace, currentGatewayFullName, currentGateway.Selector)
 
 	for _, currentServer := range currentGateway.Servers {
 		if currentServer.Tls == nil {
@@ -81,37 +80,6 @@ func (gateway *CertificateAnalyzer) analyzeDuplicateCertificate(currentResource 
 	}
 }
 
-// get all gateways that is superset of the selector
-func getGatewaysWithSelector(c analysis.Context, gwScope bool, currentGWName resource.FullName, currentGWSelector map[string]string) []resource.FullName {
-	var gateways []resource.FullName
-
-	c.ForEach(gvk.Gateway, func(resource *resource.Instance) bool {
-		// if scopeToNamespace true, ignore adding gateways from other namespace
-		if gwScope {
-			if currentGWName.Namespace != resource.Metadata.FullName.Namespace {
-				return true
-			}
-		}
-
-		// if current gateway selector is empty, match all gateway
-		if len(currentGWSelector) == 0 {
-			gateways = append(gateways, resource.Metadata.FullName)
-			return true
-		}
-
-		gateway := resource.Message.(*v1alpha3.Gateway)
-		// if current gateway selector is subset of other gateway selector
-		// add other gateway
-		if selectorSubset(currentGWSelector, gateway.Selector) {
-			gateways = append(gateways, resource.Metadata.FullName)
-		}
-
-		return true
-	})
-
-	return gateways
-}
-
 func gatewaySelectorMatches(currentGW, gatewayR *resource.Instance, gwScope bool) bool {
 	// if scopeToNamespace true, ignore gateways from other namespace
 	if gwScope {
@@ -128,10 +96,7 @@ func gatewaySelectorMatches(currentGW, gatewayR *resource.Instance, gwScope bool
 
 	gateway := gatewayR.Message.(*v1alpha3.Gateway)
 	// if current gateway selector is subset of other gateway selector
-	if selectorSubset(currentGateway.Selector, gateway.Selector) {
-		return true
-	}
-	return false
+	return selectorSubset(currentGateway.Selector, gateway.Selector)
 }
 
 func selectorSubset(selectorX, selectorY map[string]string) bool {
@@ -157,8 +122,7 @@ func selectorSubset(selectorX, selectorY map[string]string) bool {
 	return count == len(selectorX)
 }
 
-// creating an index of observed strings (credential name, server cert, key, etc), iterating through each Gateway only once.
-// When a key is encountered and already exists in the map, report.
+// create index of gateway by tls credentials
 func initIndex(c analysis.Context) map[string][]*resource.Instance {
 	gatewayIndexByCert := make(map[string][]*resource.Instance)
 	c.ForEach(gvk.Gateway, func(resource *resource.Instance) bool {

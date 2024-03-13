@@ -57,7 +57,7 @@ func (s *IngressGatewayPortAnalyzer) Analyze(c analysis.Context) {
 		podsByNamespace[ns] = append(podsByNamespace[ns], r)
 		return true
 	})
-	// for each pod, create an index of services lists by pod name
+	// for each pod, create an index of services by pod name
 	servicesByPod := map[string][]*resource.Instance{}
 	c.ForEach(gvk.Service, func(r *resource.Instance) bool {
 		svc := r.Message.(*v1.ServiceSpec)
