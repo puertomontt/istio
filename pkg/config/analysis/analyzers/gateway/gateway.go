@@ -17,7 +17,7 @@ package gateway
 import (
 	"fmt"
 
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	klabels "k8s.io/apimachinery/pkg/labels"
 
 	"istio.io/api/networking/v1alpha3"
@@ -60,7 +60,7 @@ func (s *IngressGatewayPortAnalyzer) Analyze(c analysis.Context) {
 	// for each pod, create an index of services by pod name
 	servicesByPod := map[string][]*resource.Instance{}
 	c.ForEach(gvk.Service, func(r *resource.Instance) bool {
-		svc := r.Message.(*v1.ServiceSpec)
+		svc := r.Message.(*corev1.ServiceSpec)
 		ns := r.Metadata.FullName.Namespace.String()
 		for _, pod := range podsByNamespace[ns] {
 			podLabels := klabels.Set(pod.Metadata.Labels)
@@ -100,7 +100,7 @@ func (*IngressGatewayPortAnalyzer) analyzeGateway(
 			gwSelectorMatches++
 
 			for _, rSvc := range serviceByPod[rPod.Metadata.FullName.String()] {
-				service := rSvc.Message.(*v1.ServiceSpec)
+				service := rSvc.Message.(*corev1.ServiceSpec)
 				// TODO I want to match service.Namespace to pod.ObjectMeta.Namespace
 				svcSelector := klabels.SelectorFromSet(service.Selector)
 				if svcSelector.Matches(podLabels) {
