@@ -186,6 +186,51 @@ func newProcessListener[O any](
 type eventSet[O any] struct {
 	event           []Event[O]
 	isInInitialList bool
+	// owned marks event as a slice this listener allocated while merging, so later merges may
+	// append to it in place. Slices that arrived via send() belong to the caller.
+	owned bool
+}
+
+// merge appends other onto p, reporting whether the merge was legal.
+//
+// Two sets may only merge if they agree on isInInitialList: run() calls syncTracker.Finished
+// only for initial-list sets, so mixing them would unbalance the counter. Merging two initial
+// sets is safe because the counts simply sum, and Start() was already called per send().
+//
+// Order is preserved within and between the sets, so a handler observes exactly the sequence it
+// would have seen unmerged, just in fewer batches.
+func (p eventSet[O]) merge(other eventSet[O]) (eventSet[O], bool) {
+	if p.isInInitialList != other.isInInitialList {
+		return p, false
+	}
+	if !p.owned {
+		// p.event belongs to whoever called send(); appending could write into spare capacity
+		// in their backing array. Take a copy once, then reuse it for the rest of the burst.
+		merged := make([]Event[O], 0, len(p.event)+len(other.event))
+		p.event = append(merged, p.event...)
+		p.owned = true
+	}
+	p.event = append(p.event, other.event...)
+	return p, true
+}
+
+// mergeNotifications combines two queued notifications into one when they are both event sets
+// that may legally merge. On failure it returns next unchanged, so the caller can queue prev and
+// carry next forward as the new tail.
+func mergeNotifications[O any](prev, next any) (any, bool) {
+	prevEvents, ok := prev.(eventSet[O])
+	if !ok {
+		return next, false
+	}
+	nextEvents, ok := next.(eventSet[O])
+	if !ok {
+		return next, false
+	}
+	merged, ok := prevEvents.merge(nextEvents)
+	if !ok {
+		return next, false
+	}
+	return merged, true
 }
 
 func (p *processorListener[O]) send(event []Event[O], isInInitialList bool) {
@@ -200,12 +245,27 @@ func (p *processorListener[O]) send(event []Event[O], isInInitialList bool) {
 	}
 }
 
+// pop pumps notifications from addCh to nextCh, buffering in pendingNotifications while the
+// handler is not keeping up.
+//
+// While the handler is behind, consecutive event sets are merged rather than queued separately.
+// This matters because collections dedupe changed keys *within* a batch and not across batches:
+// a burst of N changes to inputs of one derived object otherwise causes N recomputations of that
+// object instead of one. Merging restores the dedupe without adding any delay -- nothing is ever
+// held back waiting for more events, only combined with what has already piled up.
+//
+// The pending queue is [notification] ++ pendingNotifications ++ [tail]. Only tail is merged
+// into, which is enough: while notification is stuck on a slow handler, an entire burst collapses
+// into tail and pendingNotifications never grows.
 func (p *processorListener[O]) pop() {
 	defer utilruntime.HandleCrash()
 	defer close(p.nextCh)
 
 	var nextCh chan<- any
 	var notification any
+	// tail is the most recently queued notification, held outside the ring buffer so that
+	// arriving events can be merged into it. It is always the newest item in the queue.
+	var tail any
 	for {
 		select {
 		case <-p.stop:
@@ -214,19 +274,32 @@ func (p *processorListener[O]) pop() {
 			// Notification dispatched
 			var ok bool
 			notification, ok = p.pendingNotifications.ReadOne()
-			if !ok { // Nothing to pop
-				nextCh = nil // Disable this select case
+			if !ok {
+				// Ring is drained, so tail is next in line.
+				notification, tail = tail, nil
+				if notification == nil { // Nothing to pop
+					nextCh = nil // Disable this select case
+				}
 			}
 		case notificationToAdd, ok := <-p.addCh:
 			if !ok {
 				return
 			}
-			if notification == nil { // No notification to pop (and pendingNotifications is empty)
-				// Optimize the case - skip adding to pendingNotifications
+			switch {
+			case notification == nil: // Queue is empty
+				// Optimize the case - skip buffering entirely
 				notification = notificationToAdd
 				nextCh = p.nextCh
-			} else { // There is already a notification waiting to be dispatched
-				p.pendingNotifications.WriteOne(notificationToAdd)
+			case tail == nil: // There is already a notification waiting to be dispatched
+				tail = notificationToAdd
+			default:
+				// Merge into tail when the two are compatible; parentSyncedNotification is not
+				// an eventSet and so never merges, which keeps it correctly ordered.
+				merged, ok := mergeNotifications[O](tail, notificationToAdd)
+				if !ok {
+					p.pendingNotifications.WriteOne(tail)
+				}
+				tail = merged
 			}
 		}
 	}

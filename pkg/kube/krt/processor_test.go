@@ -181,12 +181,19 @@ func TestProcessor(t *testing.T) {
 	})
 }
 
+// BlockingBatchedTrackerHandler gates on allowEvents once per event rather than once per batch,
+// and records each event separately.
+//
+// Batch boundaries are not part of the listener contract: queued event sets are merged whenever
+// the handler falls behind, so how many sets a burst arrives in is timing dependent. A handler
+// that took one token per call would deadlock or mis-assert depending on how many merged. What
+// the tests here actually care about -- event order, and when HasSynced flips -- is unaffected.
 func BlockingBatchedTrackerHandler[T any](allowEvents chan struct{}, tracker *assert.Tracker[string]) func([]Event[T]) {
 	return func(o []Event[T]) {
-		<-allowEvents
-		tracker.Record(slices.Join(",", slices.Map(o, func(o Event[T]) string {
-			return fmt.Sprintf("%v/%v", o.Event, GetKey(o.Latest()))
-		})...))
+		for _, e := range o {
+			<-allowEvents
+			tracker.Record(fmt.Sprintf("%v/%v", e.Event, GetKey(e.Latest())))
+		}
 	}
 }
 
